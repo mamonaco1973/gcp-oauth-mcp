@@ -61,13 +61,6 @@ cat <<EOF
 
       ${REDIRECT_URI}
 
-  The function name is not randomised, so this URI is stable across rebuilds.
-
-  Also confirm the OAuth consent screen is PUBLISHED (not "Testing"). In
-  Testing mode, refresh tokens expire after 7 days and only allow-listed
-  users can sign in. Publishing needs no Google review — the scopes this
-  project requests (openid, email, profile) are all non-sensitive.
-
   STEP 2 — connect Claude
   -----------------------
   Settings -> Connectors -> Add custom connector, and paste:
