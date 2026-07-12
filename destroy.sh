@@ -26,8 +26,4 @@ cat <<'EOF'
 
 NOTE: Infrastructure teardown complete.
 
-NOTE: The Google OAuth client is NOT destroyed — Terraform never created it.
-      It is safe to leave in place: the redirect URI it points at is stable, so
-      the next apply will work without touching the console again. Delete it by
-      hand in APIs & Services -> Credentials if you are done for good.
 EOF
