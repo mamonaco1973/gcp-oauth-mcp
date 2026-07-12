@@ -14,6 +14,7 @@ PROJECT_ID=$(jq -r '.project_id' credentials.json)
 echo "NOTE: Enabling required APIs for project ${PROJECT_ID}..."
 
 gcloud services enable \
+    cloudresourcemanager.googleapis.com \
     cloudasset.googleapis.com \
     cloudfunctions.googleapis.com \
     run.googleapis.com \

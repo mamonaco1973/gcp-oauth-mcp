@@ -96,12 +96,18 @@ gcloud auth activate-service-account \
     --key-file=credentials.json \
     --quiet
 
-gcloud config set project "$PROJECT_ID" --quiet
-
 echo "NOTE: gcloud authenticated as ${SA_EMAIL}."
 
 # ==============================================================================
 # API enablement
+#
+# Runs BEFORE `gcloud config set project`. That command validates the project
+# through the Cloud Resource Manager API, which is not enabled on a fresh
+# project — so setting it first emits an alarming SERVICE_DISABLED warning for
+# an operation that actually succeeded. api_setup.sh passes --project explicitly
+# and does not depend on core/project being set.
 # ==============================================================================
 
 ./api_setup.sh
+
+gcloud config set project "$PROJECT_ID" --quiet
