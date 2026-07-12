@@ -1,11 +1,11 @@
 #!/bin/bash
-# ================================================================================
+# ==============================================================================
 # File: api_setup.sh
 #
 # Purpose:
-#   Enables required GCP APIs for the serverless MCP stack. Called by
-#   check_env.sh on every apply — safe to run multiple times (idempotent).
-# ================================================================================
+#   Enables required GCP APIs for the OAuth MCP stack. Called by check_env.sh on
+#   every apply — safe to run multiple times (idempotent).
+# ==============================================================================
 
 set -euo pipefail
 
@@ -20,6 +20,8 @@ gcloud services enable \
     cloudbuild.googleapis.com \
     artifactregistry.googleapis.com \
     iam.googleapis.com \
+    firestore.googleapis.com \
+    secretmanager.googleapis.com \
     --project "$PROJECT_ID" \
     --quiet
 

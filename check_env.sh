@@ -1,22 +1,22 @@
 #!/bin/bash
-# ================================================================================
+# ==============================================================================
 # File: check_env.sh
 #
 # Purpose:
-#   Pre-flight validation: verifies required tools are in PATH, credentials.json
-#   exists, authenticates the gcloud SA, and enables required APIs via
-#   api_setup.sh.
-# ================================================================================
+#   Pre-flight validation: verifies required tools are in PATH, that the Google
+#   OAuth client credentials are exported, that credentials.json exists,
+#   authenticates the gcloud SA, and enables required APIs via api_setup.sh.
+# ==============================================================================
 
 set -euo pipefail
 
-# ================================================================================
+# ==============================================================================
 # Tool check
-# ================================================================================
+# ==============================================================================
 
 echo "NOTE: Validating required commands..."
 
-commands=("gcloud" "terraform" "jq")
+commands=("gcloud" "terraform" "jq" "curl")
 all_found=true
 
 for cmd in "${commands[@]}"; do
@@ -30,9 +30,54 @@ done
 
 [ "$all_found" = true ] || exit 1
 
-# ================================================================================
+# ==============================================================================
+# Google OAuth client check
+#
+# Terraform cannot create an external OAuth client, so these must be supplied.
+# Fail loudly here rather than letting the apply get halfway and produce a
+# stack that deploys cleanly but cannot authenticate anyone.
+# ==============================================================================
+
+missing=0
+for var in MCP_GOOGLE_CLIENT_ID MCP_GOOGLE_CLIENT_SECRET; do
+    if [[ -z "${!var:-}" ]]; then
+        echo "ERROR: ${var} is not set."
+        missing=1
+    fi
+done
+
+if [[ "$missing" -eq 1 ]]; then
+    cat <<'EOF'
+
+--------------------------------------------------------------------------------
+This project needs a Google OAuth 2.0 client. Terraform cannot create one:
+google_iap_client requires an IAP brand, and external brands are console-only.
+So you create it once, by hand, and export it.
+
+  1. APIs & Services -> Credentials -> Create Credentials
+     -> OAuth client ID -> Application type: Web application
+
+  2. Export both values, then re-run:
+
+       export MCP_GOOGLE_CLIENT_ID="123456789-abc.apps.googleusercontent.com"
+       export MCP_GOOGLE_CLIENT_SECRET="GOCSPX-..."
+       ./apply.sh
+
+  3. On the FIRST apply the function URL does not exist yet, so leave the
+     redirect URI blank for now. apply.sh prints the exact URI to paste back
+     onto the client when it finishes. The function name is not randomised, so
+     that URI is stable — you only ever do this once.
+--------------------------------------------------------------------------------
+
+EOF
+    exit 1
+fi
+
+echo "NOTE: Google OAuth client ID: ${MCP_GOOGLE_CLIENT_ID}"
+
+# ==============================================================================
 # Credentials check
-# ================================================================================
+# ==============================================================================
 
 if [[ ! -f "credentials.json" ]]; then
     echo "ERROR: credentials.json not found in $(pwd)."
@@ -55,8 +100,8 @@ gcloud config set project "$PROJECT_ID" --quiet
 
 echo "NOTE: gcloud authenticated as ${SA_EMAIL}."
 
-# ================================================================================
+# ==============================================================================
 # API enablement
-# ================================================================================
+# ==============================================================================
 
 ./api_setup.sh

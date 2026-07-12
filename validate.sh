@@ -1,116 +1,39 @@
 #!/bin/bash
-# ================================================================================
+# ==============================================================================
 # File: validate.sh
 #
 # Purpose:
-#   Smoke-tests all eight GCP Serverless MCP endpoints. Authenticates as the
-#   proxy service account, acquires an OIDC id_token, and calls each route,
-#   checking for HTTP 200.
-# ================================================================================
+#   Smoke-tests the public HTTP surface without any credentials.
+#
+#   The proxy build could call every tool from a script, because the script held
+#   a service account key. That key is gone — tools now require a real Google
+#   user token, which only a browser login can produce. So this script validates
+#   what a script legitimately can, and that turns out to be the part that
+#   matters most: that the OAuth handshake works and that the auth boundary
+#   actually holds.
+# ==============================================================================
 
 set -euo pipefail
-
-# ================================================================================
-# Read deployment outputs
-# ================================================================================
 
 echo "NOTE: Reading deployment outputs..."
 
 cd 01-functions
 FUNCTION_URL=$(terraform output -raw function_url)
-SOURCE_BUCKET=$(terraform output -raw source_bucket_name)
 cd ..
 
 echo "NOTE: Function URL: ${FUNCTION_URL}"
 
-# ================================================================================
-# Acquire OIDC token via proxy SA key
-# gcloud handles the JWT signing and exchange — no manual JWT needed here.
-# ================================================================================
-
-echo "NOTE: Acquiring OIDC token..."
-
-# Save active account so gcloud state is restored on exit regardless of outcome.
-_PREV_ACCOUNT=$(gcloud config get-value account 2>/dev/null || true)
-_restore_account() {
-    if [[ -n "${_PREV_ACCOUNT:-}" ]]; then
-        gcloud config set account "$_PREV_ACCOUNT" --quiet 2>/dev/null || true
-    fi
-}
-trap _restore_account EXIT
-
-gcloud auth activate-service-account \
-    --key-file=02-proxy/proxy-sa-key.json \
-    --quiet
-
-# --audiences must match the Cloud Run service URL for the token to be accepted.
-TOKEN=$(gcloud auth print-identity-token \
-    --audiences="$FUNCTION_URL" \
-    2>/dev/null)
-
-if [[ -z "$TOKEN" ]]; then
-    echo "ERROR: Failed to acquire OIDC token."
-    exit 1
-fi
-
-echo "NOTE: Token acquired."
-
-# ================================================================================
-# Helper: call one endpoint and check for HTTP 200
-# ================================================================================
-
-call_api() {
-    local method="$1" route="$2" body="${3:-}"
-    local tmp_file http_code response
-
-    tmp_file=$(mktemp)
-
-    if [[ "$method" == "GET" ]]; then
-        http_code=$(curl -s -w "%{http_code}" -o "$tmp_file" \
-            -X GET "${FUNCTION_URL}/${route}" \
-            -H "Authorization: Bearer ${TOKEN}" \
-            < /dev/null)
-    else
-        http_code=$(curl -s -w "%{http_code}" -o "$tmp_file" \
-            -X POST "${FUNCTION_URL}/${route}" \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "${body:-{\}}" \
-            < /dev/null)
-    fi
-
-    response=$(cat "$tmp_file")
-    rm -f "$tmp_file"
-
-    if [[ "$http_code" == "200" ]]; then
-        echo "NOTE: OK  ${method} /${route}"
-        echo ""
-        if [[ "$route" == "tools" ]]; then
-            echo "$response" | jq -r '.[] | "\(.name)\t\(.route)"' \
-                | column -t -s $'\t' | sed 's/^/       /'
-        else
-            echo "$response" | sed 's/^/       /'
-        fi
-        echo ""
-    else
-        echo "ERROR: FAIL ${method} /${route} — HTTP ${http_code}"
-        echo "  $response"
-        exit 1
-    fi
-}
-
-# ================================================================================
-# Wait for IAM propagation
-# Polls /tools until HTTP 200 — IAM bindings can take up to ~60s to propagate.
-# ================================================================================
+# ==============================================================================
+# Wait for the endpoint to come up
+# The allUsers IAM binding can take up to ~60s to propagate after apply.
+# ==============================================================================
 
 wait_for_ready() {
     local max_attempts=24 attempt=0 http_code
     echo "NOTE: Waiting for endpoint to become accessible..."
     while (( attempt < max_attempts )); do
         http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X GET "${FUNCTION_URL}/tools" \
-            -H "Authorization: Bearer ${TOKEN}" \
+            "${FUNCTION_URL}/.well-known/oauth-authorization-server" \
             < /dev/null)
         if [[ "$http_code" == "200" ]]; then
             echo "NOTE: Endpoint ready after $(( attempt * 5 ))s."
@@ -126,29 +49,81 @@ wait_for_ready() {
 
 wait_for_ready
 
-# ================================================================================
-# Validate all endpoints
-# ================================================================================
+# ==============================================================================
+# Helper: assert an expected status code
+# ==============================================================================
+
+expect() {
+    local label="$1" expected="$2" method="$3" route="$4" ; shift 4
+    local tmp_file http_code
+
+    tmp_file=$(mktemp)
+    http_code=$(curl -s -w "%{http_code}" -o "$tmp_file" \
+        -X "$method" "${FUNCTION_URL}${route}" "$@" < /dev/null)
+
+    if [[ "$http_code" == "$expected" ]]; then
+        echo "NOTE: OK   ${label} (HTTP ${http_code})"
+    else
+        echo "ERROR: FAIL ${label} — expected ${expected}, got ${http_code}"
+        cat "$tmp_file"
+        rm -f "$tmp_file"
+        exit 1
+    fi
+    rm -f "$tmp_file"
+}
 
 echo ""
-echo "NOTE: Validating all endpoints..."
+echo "NOTE: Validating the OAuth handshake..."
 echo ""
 
-call_api "GET"  "tools"
-call_api "POST" "resources/compute-instances"
-call_api "POST" "resources/storage-buckets"
-call_api "POST" "resources/count-by-type"
-call_api "POST" "resources/by-label"   '{"label_key":"env","label_value":"prod"}'
-call_api "POST" "resources/static-ips"
-call_api "POST" "resources/by-type"    '{"asset_type":"compute.googleapis.com/Instance"}'
-call_api "POST" "resources/by-region"  '{"region":"us-central1"}'
-call_api "POST" "resources/describe"        '{"resource_name":"serverless-mcp-func"}'
-call_api "POST" "resources/cloud-functions"
-call_api "POST" "resources/bucket-objects"  "{\"bucket_name\":\"${SOURCE_BUCKET}\"}"
+# ------------------------------------------------------------------------------
+# The three requests Claude makes before a token exists. All must work while
+# completely unauthenticated, or the connector can never bootstrap.
+# ------------------------------------------------------------------------------
+
+expect "discovery (RFC 8414)"      200 GET  "/.well-known/oauth-authorization-server"
+expect "resource metadata"         200 GET  "/.well-known/oauth-protected-resource"
+expect "registration (RFC 7591)"   201 POST "/oauth/register" \
+    -H "Content-Type: application/json" -d '{}'
+
+echo ""
+echo "NOTE: Validating the auth boundary..."
+echo ""
+
+# ------------------------------------------------------------------------------
+# The tools must be unreachable without a valid Google token. A 200 from either
+# of these would mean the whole thing is wide open.
+# ------------------------------------------------------------------------------
+
+expect "/mcp rejects no token"     401 POST "/mcp" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+expect "/mcp rejects bad token"    401 POST "/mcp" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer not-a-real-token" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# ==============================================================================
+# Show the discovery document and the WWW-Authenticate header — these are what
+# Claude actually reads to find its way to the login.
+# ==============================================================================
+
+echo ""
+echo "NOTE: Authorization server metadata:"
+curl -s "${FUNCTION_URL}/.well-known/oauth-authorization-server" \
+    | jq . | sed 's/^/       /'
+
+echo ""
+echo "NOTE: Unauthenticated /mcp probe returns the login pointer:"
+curl -s -D - -o /dev/null -X POST "${FUNCTION_URL}/mcp" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+    | grep -i "^www-authenticate" | sed 's/^/       /'
 
 echo ""
 echo "========================================================================"
-echo "  Validation complete — all 11 endpoints returned HTTP 200."
+echo "  Validation complete — handshake works, tools are protected."
 echo "========================================================================"
-echo "  API: ${FUNCTION_URL}"
+echo "  Connector URL: ${FUNCTION_URL}/mcp"
 echo "========================================================================"

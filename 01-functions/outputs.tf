@@ -1,15 +1,16 @@
 output "function_url" {
-  value = google_cloudfunctions2_function.serverless_mcp.service_config[0].uri
+  description = "Base URL of the MCP function."
+  value       = google_cloudfunctions2_function.mcp.service_config[0].uri
 }
 
-output "proxy_sa_key_json" {
-  description = "Proxy SA key JSON — written to 02-proxy/proxy-sa-key.json by apply.sh."
-  value       = base64decode(google_service_account_key.proxy.private_key)
-  sensitive   = true
+output "mcp_url" {
+  description = "The URL to paste into Claude when adding the connector."
+  value       = "${google_cloudfunctions2_function.mcp.service_config[0].uri}/mcp"
 }
 
-output "proxy_sa_email" {
-  value = google_service_account.proxy.email
+output "oauth_redirect_uri" {
+  description = "Authorized redirect URI to register on the Google OAuth client."
+  value       = "${google_cloudfunctions2_function.mcp.service_config[0].uri}/oauth/callback"
 }
 
 output "project_id" {

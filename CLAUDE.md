@@ -1,93 +1,101 @@
-# CLAUDE.md — gcp-serverless-mcp
+# CLAUDE.md — gcp-oauth-mcp
 
-A serverless GCP Cloud Asset Inventory API designed for MCP (Model Context
-Protocol) tool use. Ten Cloud Functions 2nd Gen handlers expose resource
-inventory tools behind an HTTP API secured with GCP OIDC authentication. A
-local MCP proxy acquires OIDC tokens from a service account key file and makes
-the remote serverless backend transparent to the AI caller.
+A GCP Cloud Asset Inventory API exposed as a **remote MCP connector** secured
+with **Google OAuth 2.0**. Claude connects directly to a remote `/mcp` endpoint
+over HTTPS, the user logs in with their Google account, and the tools run —
+**no local proxy, no service account key file, nothing to configure but a URL.**
+
+> This is the OAuth port of `gcp-serverless-mcp`, which kept the function private
+> behind Cloud Run IAM and shipped a local proxy that signed OIDC assertions with
+> a downloaded SA key. The OAuth broker pattern is adapted from `aws-cognito-mcp`
+> (`01-lambdas/code/oauth.py` + `mcp.py`), with Google in place of Cognito.
 
 ---
 
 ## What This Project Does
 
-An AI assistant calls MCP tools that appear local but are backed by a Cloud
-Function querying the GCP Cloud Asset Inventory API. Responses are plain-text
-summaries suitable for direct narration — not raw JSON.
+One Cloud Function (2nd Gen) is the entire stack. It serves the OAuth
+authorization-server endpoints **and** the MCP JSON-RPC endpoint, and calls the
+ten Cloud Asset Inventory tools in-process on `tools/call`.
 
-The proxy self-configures at startup by calling `GET /tools`, so route
-mappings and tool schemas are defined once in `main.py` with no hardcoding
-in the proxy.
-
-**Base URL after deploy:**
-```
-https://{func-name}-uc.a.run.app
-```
-
-| Tool Name | Route | Operation |
-|---|---|---|
-| *(proxy startup)* | `GET /tools` | Tool registry for proxy self-config |
-| list_compute_instances | `POST /resources/compute-instances` | All VMs with machine type, zone, status |
-| list_storage_buckets | `POST /resources/storage-buckets` | All GCS buckets with location and storage class |
-| count_resources_by_type | `POST /resources/count-by-type` | Ranked inventory summary |
-| find_resources_by_label | `POST /resources/by-label` | Resources matching label key+value |
-| list_static_ip_addresses | `POST /resources/static-ips` | All static external IPs |
-| find_resources_by_type | `POST /resources/by-type` | Resources of a specific asset type |
-| find_resources_by_region | `POST /resources/by-region` | Resources in a specific region or zone |
-| describe_resource | `POST /resources/describe` | Full config detail for a named resource |
-| list_cloud_functions_detail | `POST /resources/cloud-functions` | All Cloud Functions with runtime, memory, URL, SA, env vars |
-| list_bucket_objects | `POST /resources/bucket-objects` | All objects in a GCS bucket with size and last-modified |
+| Tool | Operation |
+|---|---|
+| list_compute_instances | All VMs with machine type, zone, status |
+| list_storage_buckets | All GCS buckets with location and storage class |
+| count_resources_by_type | Ranked inventory summary |
+| find_resources_by_label | Resources matching a label key+value |
+| list_static_ip_addresses | All static external IPs |
+| find_resources_by_type | Resources of a specific asset type |
+| find_resources_by_region | Resources in a region or zone |
+| describe_resource | Full config detail for a named resource |
+| list_cloud_functions_detail | Functions with runtime, memory, URL, SA, env vars |
+| list_bucket_objects | Objects in a GCS bucket with size and last-modified |
 
 ---
 
 ## Architecture
 
 ```
-AI assistant (MCP client)
-     │  stdio / JSON-RPC
+Claude (claude.ai / Claude Desktop) — remote MCP client
+     │  1. probe:     POST /mcp with no token → 401 + WWW-Authenticate
+     │  2. discover:  GET  /.well-known/oauth-authorization-server   (RFC 8414)
+     │  3. register:  POST /oauth/register                           (RFC 7591)
+     │  4. login:     GET  /authorize → accounts.google.com → GET /oauth/callback
+     │  5. token:     POST /oauth/token   (gcp_ code → Google access token)
+     │  6. use:       POST /mcp  (Authorization: Bearer <google access token>)
      ▼
-02-proxy/proxy.sh (or proxy.ps1)
-  ├─ Signs OIDC JWT with proxy SA key file (RS256)
-  ├─ Exchanges JWT at https://oauth2.googleapis.com/token → id_token
-  └─ Sends Authorization: Bearer <id_token> on every request
-     │  HTTPS + OIDC Bearer auth
-     ▼
-Cloud Function 2nd Gen (serverless-mcp-func-xxxx-uc.a.run.app)
-  ├─ Cloud Run validates OIDC token at platform level (no in-code auth)
-  ├─ GET  /tools                           → TOOL_REGISTRY JSON (proxy startup)
-  ├─ POST /resources/compute-instances     → VM inventory
-  ├─ POST /resources/storage-buckets       → GCS bucket list
-  ├─ POST /resources/count-by-type         → ranked resource type summary
-  ├─ POST /resources/by-label              → filter by label key+value
-  ├─ POST /resources/static-ips            → static external IP inventory
-  ├─ POST /resources/by-type               → resources of a specific type
-  ├─ POST /resources/by-region             → resources in a named region
-  ├─ POST /resources/describe              → full config for a named resource
-  ├─ POST /resources/cloud-functions       → Cloud Function detail
-  └─ POST /resources/bucket-objects        → objects in a GCS bucket
-       │
-       │  Application Default Credentials (function SA)
-       ▼
-  Cloud Asset Inventory API          Cloud Storage API
-  scope: projects/{PROJECT_ID}       (list_bucket_objects only)
+Cloud Function 2nd Gen — gcp-oauth-mcp-func   [PUBLIC; the code enforces auth]
+     ├── main.py    route table
+     ├── oauth.py   OAuth broker  ── Firestore (transient pending-auth / codes)
+     ├── mcp.py     JSON-RPC; validates Bearer via Google tokeninfo
+     └── tools.py   10 CAI tools, called in-process
+                    │  ADC → function SA
+                    ▼
+     Cloud Asset Inventory API        Cloud Storage API
+     scope: projects/{PROJECT_ID}     (list_bucket_objects only)
 ```
 
-**Auth layers:**
-1. Proxy signs an OIDC JWT with the proxy SA private key, exchanges it at
-   the Google token endpoint, and gets an id_token with the function URL as
-   audience
-2. Cloud Run validates the id_token signature, audience, and expiry at the
-   platform level — the function never sees unauthenticated requests
-3. The function's service account queries Cloud Asset Inventory and Cloud
-   Storage via ADC — no credentials in code (`roles/cloudasset.viewer` and
-   `roles/storage.objectViewer` assigned at project scope)
+### The two gaps the broker exists to close
 
-**Why platform-level auth (not in-code):** Unlike Azure Functions FC1 which
-does not support Easy Auth, Cloud Run (backing CF2) validates OIDC tokens
-natively. This eliminates the JWKS-fetch-and-verify code needed in the Azure
-variant.
+1. **claude.ai's `redirect_uri` is dynamic** — it embeds the org ID
+   (`https://claude.ai/api/organizations/<id>/mcp/callback`). Google requires an
+   exact allow-list match, so it can never be registered. We register only our
+   own fixed `/oauth/callback` and carry Claude's URL through Firestore, keyed by
+   the `state` we hand Google.
+2. **Google does not implement RFC 7591** dynamic client registration. Without
+   `/oauth/register`, Claude would have no `client_id` and the user would be
+   pasting credentials by hand — which is exactly the experience
+   `aws-agentcore-mcp` is stuck with.
 
-**Why plain-text responses:** Cloud Asset Inventory returns nested proto
-structs. Pre-formatted summaries let the AI narrate results without parsing.
+The token handed to Claude is a **genuine Google access token**. We mint no JWTs
+and hold no signing keys. There is no custom crypto in this repo.
+
+---
+
+## Auth model — read this before changing anything
+
+**The function is public.** `google_cloud_run_v2_service_iam_member` grants
+`roles/run.invoker` to `allUsers`. This is deliberate and it is the inversion at
+the heart of the port:
+
+- The OAuth endpoints **cannot** require a token — obtaining one is their job.
+- Claude probes `/mcp` **unauthenticated on purpose**, to read the
+  `WWW-Authenticate` header that tells it where to log in.
+
+An IAM invoker check would reject both before Python ever runs. So auth moves
+into the code: `mcp._get_auth_user` requires a `Bearer` token on every `/mcp`
+call and 401s otherwise.
+
+**Token validation pins the audience.** `mcp._resolve_user` calls Google's
+`tokeninfo` endpoint and **rejects any token whose `aud` is not our
+`client_id`**. This matters more than it looks: a plain `/userinfo` check would
+accept a valid Google token minted for *any* application on the internet. The
+audience check is what makes the token ours.
+
+**AuthN only, no authZ.** Every authenticated Google user is authorized. Anyone
+with a Google account who reaches the endpoint can read this project's resource
+inventory. That is fine for a demo; it is not fine for anything real. To lock it
+down, filter on the `email` / `hd` claim in `_resolve_user`.
 
 ---
 
@@ -96,126 +104,91 @@ structs. Pre-formatted summaries let the AI narrate results without parsing.
 ```
 01-functions/
   code/
-    main.py          All ten handlers + Cloud Asset Inventory + Storage clients
-    requirements.txt functions-framework, google-cloud-asset, google-cloud-storage
-  main.tf            google + random + archive providers, project locals
-  functions.tf       Service accounts, GCS source bucket, CF2 function,
-                     Cloud Run IAM binding
-  outputs.tf         function_url, proxy_sa_key_json, proxy_sa_email,
-                     project_id, source_bucket_name
-02-proxy/
-  proxy.sh           Bash MCP stdio proxy (OIDC token, JSON-RPC dispatcher)
-  proxy.ps1          PowerShell 7+ equivalent of proxy.sh
-  claude_desktop_config_sh.json.tmpl   Claude Desktop config template (bash)
-  claude_desktop_config_ps1.json.tmpl  Claude Desktop config template (pwsh)
+    main.py          Entry point; route table (OAuth + MCP)
+    oauth.py         OAuth broker: discovery, DCR, authorize, callback, token
+    mcp.py           MCP JSON-RPC; Bearer validation; tools/call dispatch
+    tools.py         TOOL_REGISTRY + 10 CAI handlers + TOOL_FUNCTIONS map
+    requirements.txt functions-framework, cloud-asset, storage, firestore
+  main.tf            Providers; project locals from credentials.json
+  variables.tf       google_client_id / google_client_secret (no defaults) + region
+  functions.tf       Function SA + IAM, source bucket, CF2 function, allUsers invoker
+  secrets.tf         Client secret in Secret Manager + accessor binding
+  firestore.tf       Firestore database + TTL policies on the two state collections
+  outputs.tf         function_url, mcp_url, oauth_redirect_uri, project_id
 api_setup.sh         Enable required GCP APIs
-check_env.sh         Pre-flight: verify gcloud/terraform/jq + credentials.json
-apply.sh             Full deployment + key export + config generation + validation
-destroy.sh           Teardown + cleanup of generated files
-validate.sh          Acquires OIDC token, calls all 11 endpoints, checks HTTP 200
+check_env.sh         Pre-flight: tools + MCP_GOOGLE_* vars + credentials.json
+apply.sh             Deploy + validate + print connector instructions
+destroy.sh           Teardown
+validate.sh          Unauthenticated smoke test of the handshake + auth boundary
 credentials.json     GCP service account key (gitignored — place in repo root)
 ```
 
 ---
 
-## Prerequisites
+## The one manual step
 
-- `gcloud`, `terraform`, `jq` in PATH
-- `credentials.json` (GCP service account key) in repo root
-- Service account needs: Cloud Functions Admin, Cloud Run Admin,
-  Cloud Build Editor, Artifact Registry Admin, IAM Admin,
-  Cloud Asset Viewer, Storage Admin, Service Account Admin,
-  Service Account Key Admin, Project IAM Admin
-
----
-
-## Deployment
+Terraform **cannot** create the Google OAuth client. `google_iap_client`
+requires an IAP brand, and external brands are console-only. So:
 
 ```bash
-./apply.sh   # full deploy
-./destroy.sh # teardown
-./validate.sh # smoke test (after deploy)
+export MCP_GOOGLE_CLIENT_ID="123456789-abc.apps.googleusercontent.com"
+export MCP_GOOGLE_CLIENT_SECRET="GOCSPX-..."
+./apply.sh
 ```
 
-`apply.sh` runs in sequence:
-1. **`check_env.sh`** — validates tools, authenticates gcloud,
-   calls `api_setup.sh` to enable APIs
-2. **`01-functions` Terraform** — deploys Cloud Function, service accounts,
-   IAM bindings, and source bucket
-3. **Key export** — writes proxy SA key JSON to `02-proxy/proxy-sa-key.json`
-4. **Config generation** — reads Terraform outputs, builds
-   `02-proxy/claude_desktop_config_*.json` via `jq` (gitignored)
-5. **`validate.sh`** — acquires an OIDC token and calls all 11 endpoints
+`check_env.sh` hard-fails if either is missing. `apply.sh` prints the redirect
+URI to paste onto the client when it finishes.
+
+**This is a developer step, done once — not a user step.** End users still
+connect with nothing but a URL. That distinction is the whole point of the
+project, and it is what separates this from `aws-agentcore-mcp`, where *every
+user* has to paste a client ID and secret.
 
 ---
 
-## Terraform Resources
+## Environment variables (function)
 
-### 01-functions
+| Var | Source | Used by |
+|-----|--------|---------|
+| `GOOGLE_CLOUD_PROJECT` | `local.project_id` | tools.py |
+| `MCP_GOOGLE_CLIENT_ID` | `var.google_client_id` | oauth.py + mcp.py (audience check) |
+| `MCP_GOOGLE_CLIENT_SECRET` | Secret Manager | oauth.py |
 
-- `google_service_account` `serverless-mcp-func-sa` — function identity
-- `google_project_iam_member` — `roles/cloudasset.viewer` for function SA
-- `google_project_iam_member` — `roles/storage.objectViewer` for function SA
-- `google_service_account` `serverless-mcp-proxy-sa` — proxy identity
-- `google_service_account_key` — JSON key for proxy SA (sensitive output)
-- `google_storage_bucket` `serverless-mcp-src-{suffix}` — function source
-- `data.archive_file` — zips `code/` directory; content hash in object name
-  triggers redeploy on any source change
-- `google_storage_bucket_object` — uploads zip to source bucket
-- `google_cloudfunctions2_function` `serverless-mcp-func-{suffix}` —
-  Python 3.11, function SA identity, 10 max instances
-- `google_cloudfunctions2_function_iam_member` — `roles/cloudfunctions.invoker`
-  for proxy SA (CF2 function layer)
-- `google_cloud_run_v2_service_iam_member` — `roles/run.invoker` for proxy SA
-  (Cloud Run HTTP layer — both bindings required for CF2 invocation)
+The secret is mounted via `secret_environment_variables`, not a plain env var —
+because `list_cloud_functions_detail` **prints function environment variables**,
+so a plaintext secret would be readable through the very tools it protects.
 
 ---
 
-## Function Code
+## Adding a tool
 
-All ten handlers live in `main.py` and follow the same pattern:
-1. `_list_assets(types)` or `_search_resources(query)` — queries Cloud Asset
-   Inventory via `AssetServiceClient` (ADC → function SA at runtime)
-2. `_to_dict(asset.resource.data)` — converts proto Struct or proto-plus
-   MapComposite to a plain Python dict (falls back from `MessageToDict` when
-   proto-plus has already unwrapped the Struct)
-3. Format results as plain-text and return `(body, status, headers)` tuple
-
-`list_bucket_objects` uses `google.cloud.storage.Client` (also ADC) instead
-of Cloud Asset Inventory.
-
-**Two CAI query methods:**
-- `_list_assets()` — `ListAssetsRequest` with `content_type=RESOURCE`; returns
-  full resource data (machine type, status, etc.)
-- `_search_resources()` — `SearchAllResourcesRequest`; supports label queries
-  and free-text filtering; used for label/type/region filtering tools
-
-**Parameterized tools:** `find_resources_by_label`, `find_resources_by_type`,
-`find_resources_by_region`, `describe_resource`, and `list_bucket_objects`
-read input from the POST body via `_get_body()`.
+1. Write the handler in `tools.py` — takes an `args` dict, returns a string.
+2. Add its entry to `TOOL_REGISTRY`.
+3. Add the name → callable mapping to `TOOL_FUNCTIONS`.
+4. `./apply.sh`. `tools/list` picks it up automatically.
 
 ---
 
-## MCP Proxy
+## Gotchas that have bitten
 
-`02-proxy/proxy.sh` (and `proxy.ps1` for Windows) is a stdio MCP server:
-- Reads JSON-RPC 2.0 messages from stdin, writes responses to stdout
-- On startup, acquires an OIDC id_token, then calls `GET /tools` to populate
-  route map and tool list
-- Token acquisition: self-signed RS256 JWT → POST to
-  `https://oauth2.googleapis.com/token` →`id_token`
-- Caches the token; re-acquires 60s before expiry
-- Handles `initialize`, `tools/list`, and `tools/call` methods
+- **Refresh is mandatory here.** Google access tokens last one hour and that is
+  not configurable. The Cognito build could skip the `refresh_token` grant
+  because Cognito allows a 24-hour access token; this one cannot.
+- **`prompt=consent` is not decoration.** Without it Google omits the
+  `refresh_token` for a user who has already granted access, and the connector
+  dies silently after an hour.
+- **Don't randomise the function name.** The URL derives from it, and that URL is
+  the registered OAuth redirect URI. A random suffix means a console trip after
+  every rebuild.
+- **Consent screen must be published.** In "Testing" mode refresh tokens expire
+  after 7 days and only allow-listed users can sign in. Publishing requires no
+  Google review — `openid`, `email`, and `profile` are all non-sensitive scopes.
+- **Don't put an authorizer in front of `/mcp`.** Same lesson as `aws-cognito-mcp`:
+  the flow breaks before a token exists.
+- The `.drawio` / `.png` diagrams and `00-resources/` still depict the old
+  proxy design — regenerate before reusing them.
 
-Required environment variables (written into the generated config files):
-```
-MCP_SA_KEY_FILE   Path to proxy-sa-key.json (written by apply.sh)
-MCP_API_ENDPOINT  Cloud Function URL (no trailing slash)
-```
+## Code Commenting Standards
 
-After `./apply.sh`, open `02-proxy/claude_desktop_config_ps1.json` (or `_sh`),
-replace `REPLACE_WITH_ABSOLUTE_PATH` with the actual path to the repo, and
-merge the `mcpServers` block into your Claude Desktop config.
-
-**Note:** `proxy.ps1` requires PowerShell 7+ (`pwsh`) for `ImportFromPem()`
-RSA key loading.
+See the workspace-root `.claude/CLAUDE.md`: comment the *why*, not the *what*;
+`# ===` section headers; inline comments only for non-obvious intent.

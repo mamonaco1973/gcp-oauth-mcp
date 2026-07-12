@@ -1,87 +1,82 @@
 #!/bin/bash
-# ================================================================================
+# ==============================================================================
 # File: apply.sh
 #
 # Purpose:
-#   Orchestrates end-to-end deployment of the GCP Serverless MCP stack:
-#   environment validation → Terraform (infra + function) →
-#   proxy SA key export → Claude Desktop config generation → validation.
-# ================================================================================
+#   Deploys the GCP OAuth MCP stack: environment validation -> Terraform ->
+#   validation -> connector instructions.
+#
+#   There is no key export and no Claude Desktop config generation here. That is
+#   the point of this build: users authenticate as themselves through Google, so
+#   there is nothing to hand them but a URL.
+# ==============================================================================
 
 set -euo pipefail
-
-# ================================================================================
-# Environment pre-check
-# ================================================================================
 
 echo "NOTE: Running environment validation..."
 ./check_env.sh
 
-# ================================================================================
+# ==============================================================================
 # Deploy infrastructure and function
-# ================================================================================
+# ==============================================================================
 
 echo "NOTE: Deploying GCP infrastructure..."
 
 cd 01-functions
 terraform init -upgrade
-terraform apply -auto-approve
+terraform apply -auto-approve \
+    -var="google_client_id=${MCP_GOOGLE_CLIENT_ID}" \
+    -var="google_client_secret=${MCP_GOOGLE_CLIENT_SECRET}"
 
-FUNCTION_URL=$(terraform output -raw function_url)
-PROJECT_ID=$(terraform output -raw project_id)
-SA_EMAIL=$(terraform output -raw proxy_sa_email)
-
-echo "NOTE: Function URL:  ${FUNCTION_URL}"
-echo "NOTE: Project ID:    ${PROJECT_ID}"
-echo "NOTE: Proxy SA:      ${SA_EMAIL}"
-
-# ------------------------------------------------------------------------------
-# Export proxy SA key
-# Sensitive output written to a gitignored file for proxy use.
-# ------------------------------------------------------------------------------
-
-echo "NOTE: Writing proxy SA key..."
-terraform output -raw proxy_sa_key_json > ../02-proxy/proxy-sa-key.json
-chmod 600 ../02-proxy/proxy-sa-key.json
-
+MCP_URL=$(terraform output -raw mcp_url)
+REDIRECT_URI=$(terraform output -raw oauth_redirect_uri)
 cd ..
 
-# ================================================================================
-# Generate Claude Desktop MCP config files
-# ================================================================================
-
-# Build config files directly from Terraform outputs — output files are
-# gitignored as they contain a real service account key path.
-echo "NOTE: Generating Claude Desktop config files..."
-
-jq -n \
-    --arg url "$FUNCTION_URL" \
-    '{mcpServers: {"gcp-resource-mcp": {command: "pwsh",
-      args: ["-File",
-        "REPLACE_WITH_ABSOLUTE_PATH\\gcp-serverless-mcp\\02-proxy\\proxy.ps1"],
-      env: {
-        MCP_SA_KEY_FILE:
-          "REPLACE_WITH_ABSOLUTE_PATH\\gcp-serverless-mcp\\02-proxy\\proxy-sa-key.json",
-        MCP_API_ENDPOINT: $url}}}}' \
-    > 02-proxy/claude_desktop_config_ps1.json
-
-jq -n \
-    --arg url "$FUNCTION_URL" \
-    '{mcpServers: {"gcp-resource-mcp": {command: "bash",
-      args: [
-        "REPLACE_WITH_ABSOLUTE_PATH/gcp-serverless-mcp/02-proxy/proxy.sh"],
-      env: {
-        MCP_SA_KEY_FILE:
-          "REPLACE_WITH_ABSOLUTE_PATH/gcp-serverless-mcp/02-proxy/proxy-sa-key.json",
-        MCP_API_ENDPOINT: $url}}}}' \
-    > 02-proxy/claude_desktop_config_sh.json
-
-echo "NOTE: Config written to 02-proxy/claude_desktop_config_ps1.json"
-echo "NOTE: Config written to 02-proxy/claude_desktop_config_sh.json"
-
-# ================================================================================
+# ==============================================================================
 # Post-deployment validation
-# ================================================================================
+# ==============================================================================
 
 echo "NOTE: Running post-deployment validation..."
 ./validate.sh
+
+# ==============================================================================
+# Connector instructions
+#
+# The redirect URI is printed every run, not just the first. It is the one
+# manual step in the whole deploy, and a stale or missing entry on the OAuth
+# client produces a redirect_uri_mismatch at login — an error whose cause is
+# nowhere near where it surfaces.
+# ==============================================================================
+
+cat <<EOF
+
+================================================================================
+  Deployment complete.
+================================================================================
+
+  STEP 1 — one time, in the Cloud Console
+  ---------------------------------------
+  APIs & Services -> Credentials -> your OAuth 2.0 client
+  Add this under "Authorized redirect URIs":
+
+      ${REDIRECT_URI}
+
+  The function name is not randomised, so this URI is stable across rebuilds.
+
+  Also confirm the OAuth consent screen is PUBLISHED (not "Testing"). In
+  Testing mode, refresh tokens expire after 7 days and only allow-listed
+  users can sign in. Publishing needs no Google review — the scopes this
+  project requests (openid, email, profile) are all non-sensitive.
+
+  STEP 2 — connect Claude
+  -----------------------
+  Settings -> Connectors -> Add custom connector, and paste:
+
+      ${MCP_URL}
+
+  That is the whole configuration. No client ID, no secret, no key file, and
+  no local proxy. Claude discovers the authorization server, registers itself,
+  and sends you to Google to log in.
+
+================================================================================
+EOF

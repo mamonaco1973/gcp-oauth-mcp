@@ -1,12 +1,13 @@
 #!/bin/bash
-# ================================================================================
+# ==============================================================================
 # File: destroy.sh
 #
 # Purpose:
-#   Tears down the GCP Serverless MCP stack deployed by apply.sh.
-#   Destroys the Cloud Function, service accounts, SA key, and source bucket,
-#   then removes generated local files.
-# ================================================================================
+#   Tears down the GCP OAuth MCP stack deployed by apply.sh.
+#
+#   Nothing is generated locally by this build — no SA key, no Claude Desktop
+#   config — so there is nothing to clean up on disk. Terraform owns everything.
+# ==============================================================================
 
 set -euo pipefail
 
@@ -16,13 +17,17 @@ echo "NOTE: Destroying GCP infrastructure..."
 
 cd 01-functions
 terraform init -upgrade
-# Run twice — dependency ordering occasionally requires a second pass.
-terraform destroy -auto-approve || true
+terraform destroy -auto-approve \
+    -var="google_client_id=${MCP_GOOGLE_CLIENT_ID}" \
+    -var="google_client_secret=${MCP_GOOGLE_CLIENT_SECRET}"
 cd ..
 
-# Remove generated files that contain credentials or deployment-specific paths.
-rm -f 02-proxy/proxy-sa-key.json
-rm -f 02-proxy/claude_desktop_config_ps1.json
-rm -f 02-proxy/claude_desktop_config_sh.json
+cat <<'EOF'
 
-echo "NOTE: Infrastructure teardown complete."
+NOTE: Infrastructure teardown complete.
+
+NOTE: The Google OAuth client is NOT destroyed — Terraform never created it.
+      It is safe to leave in place: the redirect URI it points at is stable, so
+      the next apply will work without touching the console again. Delete it by
+      hand in APIs & Services -> Credentials if you are done for good.
+EOF
