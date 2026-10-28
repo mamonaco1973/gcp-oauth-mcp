@@ -1,10 +1,10 @@
-# GCP OAuth MCP — a remote MCP server on Cloud Functions, secured with Google OAuth
+# Remote MCP Server on GCP: Cloud Functions with Google OAuth Login
 
 Connect Claude directly to your GCP resource inventory. No local proxy. No
 service account key file on your laptop. You paste a URL, you log in with
 Google, and the tools work.
 
-This is the OAuth port of `gcp-serverless-mcp`, which kept the Cloud Function
+This is the OAuth port of [`gcp-serverless-mcp`](https://github.com/mamonaco1973/gcp-serverless-mcp), which kept the Cloud Function
 private behind Cloud Run IAM and shipped a local proxy that signed OIDC
 assertions with a **downloaded service account private key**. That key was the
 single credential for all MCP access — no expiry, no rotation, no per-user
@@ -20,29 +20,36 @@ This version deletes it.
 | Function exposure | Private (Cloud Run IAM) | Public; the code enforces auth |
 | Auth enforced by | The platform | `mcp.py`, on every call |
 
----
+| Piece | Where | Role |
+|---|---|---|
+| **gcp-oauth-mcp-func** | Cloud Functions, `us-central1` | 2nd gen, Python 3.11, 256 MB, 60 s, 0 to 10 instances; public (`allUsers` invoker); `oauth.py` (the broker), `mcp.py` (JSON-RPC and token checks) and `tools.py`; the name is fixed so its redirect URI stays the same |
+| **gcp-oauth-mcp-sa** | IAM | the function's identity: `cloudasset.viewer`, `storage.objectViewer` and `datastore.user`, and access to the one secret |
+| **Firestore** | `(default)`, native mode | collections `mcp_pending_auth` and `mcp_auth_codes`, each with a TTL policy on `expires_at` |
+| **gcp-oauth-mcp-client-secret** | Secret Manager | your Google OAuth client secret |
+| **Google OAuth client** | your project | a **Web application** client you create by hand; its redirect URI is the function's `/oauth/callback` |
+| **gcp-oauth-mcp-src-&lt;hex&gt;** | Cloud Storage | the function's source zip |
 
 ## Architecture
 
-```
-Claude (claude.ai / Claude Desktop)
-     │  1. probe:     POST /mcp with no token → 401 + WWW-Authenticate
-     │  2. discover:  GET  /.well-known/oauth-authorization-server   (RFC 8414)
-     │  3. register:  POST /oauth/register                           (RFC 7591)
-     │  4. login:     GET  /authorize → accounts.google.com → /oauth/callback
-     │  5. token:     POST /oauth/token
-     │  6. use:       POST /mcp  (Bearer <google access token>)
-     ▼
-Cloud Function 2nd Gen — one function, public, auth enforced in code
-     ├── oauth.py   OAuth broker  ── Firestore (transient login state, 5-min TTL)
-     ├── mcp.py     JSON-RPC; validates the Bearer token against Google
-     └── tools.py   10 Cloud Asset Inventory tools, called in-process
-                    ▼
-     Cloud Asset Inventory API   ·   Cloud Storage API
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="architecture-dark.svg">
+  <img alt="Claude reaches gcp-oauth-mcp-func, a public second-generation Cloud Function that is both an OAuth authorization server and the MCP server. Claude probes /mcp, discovers the authorization server, registers itself, and sends the user's browser through /authorize to Google sign-in with your OAuth client; the function exchanges the code for tokens and returns the Google access token to Claude. Login state lives in Firestore with TTL policies, and the OAuth client secret comes from Secret Manager. MCP calls on /mcp carry the access token, which the function checks with Google, pinning the audience to its own client ID, and the ten tools query Cloud Asset Inventory and Cloud Storage as the gcp-oauth-mcp-sa service account." src="architecture-light.svg">
+</picture>
 
-The function plays **two roles at once**. To Claude it *is* the OAuth
-authorization server. To Google it is an ordinary OAuth *client*.
+Regenerate with `python3 make_diagram.py`.
+
+The function plays two roles at once: to Claude it *is* the OAuth
+authorization server, and to Google it is an ordinary OAuth *client*.
+Connecting goes like this:
+
+1. **Probe:** `POST /mcp` with no token returns `401` and a
+   `WWW-Authenticate` header pointing at the metadata.
+2. **Discover:** `GET /.well-known/oauth-authorization-server` (RFC 8414).
+3. **Register:** `POST /oauth/register` (RFC 7591) gives Claude a client ID.
+4. **Log in:** `GET /authorize` sends the browser to `accounts.google.com`,
+   which returns to `/oauth/callback`.
+5. **Token:** `POST /oauth/token` returns the Google access token.
+6. **Use:** `POST /mcp` with `Authorization: Bearer <access token>`.
 
 ### Why a broker, and not just "point Claude at Google"?
 
@@ -82,8 +89,6 @@ Responses are pre-formatted plain text, not JSON — Cloud Asset Inventory retur
 deeply nested proto structs, and the model narrates a text table far better than
 it parses one.
 
----
-
 ## Prerequisites
 
 - `gcloud`, `terraform`, `jq`, `curl` in PATH
@@ -93,9 +98,15 @@ it parses one.
   Admin, Service Account Admin, Project IAM Admin, Secret Manager Admin,
   Datastore Owner
 
----
+If this is your first time following along, we recommend starting with this
+video: [GCP + Terraform: Easy Setup](https://youtu.be/3spJpYX4f7I).
 
 ## Deploy
+
+```bash
+git clone https://github.com/mamonaco1973/gcp-oauth-mcp.git
+cd gcp-oauth-mcp
+```
 
 ### Step 1 — create the Google OAuth client (once, by hand)
 
@@ -135,20 +146,37 @@ refresh tokens expire after 7 days and only allow-listed users can sign in.
 Publishing needs **no Google verification review**: `openid`, `email`, and
 `profile` are all non-sensitive scopes. It is a button, not an audit.
 
-### Step 4 — connect Claude
+`apply.sh` ends by running `validate.sh`, which checks the OAuth handshake
+and that the tools are protected:
 
-**Settings → Connectors → Add custom connector**, and paste the `/mcp` URL that
-`apply.sh` printed.
+```
+NOTE: OK   discovery (RFC 8414) (HTTP 200)
+NOTE: OK   resource metadata (HTTP 200)
+NOTE: OK   registration (RFC 7591) (HTTP 201)
+NOTE: OK   /mcp rejects no token (HTTP 401)
+NOTE: OK   /mcp rejects bad token (HTTP 401)
 
-That is the entire configuration. Claude discovers the authorization server,
-registers itself, and sends you to Google to log in.
-
-```bash
-./validate.sh   # smoke-test the handshake and the auth boundary
-./destroy.sh    # tear it down
+========================================================================
+  Validation complete — handshake works, tools are protected.
+========================================================================
+  Connector URL: https://gcp-oauth-mcp-func-<hash>.a.run.app/mcp
+========================================================================
 ```
 
----
+## Try it
+
+1. In Claude, open **Settings > Connectors > Add custom connector** and
+   paste the **Connector URL**.
+2. Claude discovers the authorization server, registers itself, and sends
+   you to Google to sign in.
+3. Ask, for example, "What's running in us-central1?" or "Count my
+   resources by type."
+
+## Teardown
+
+```bash
+./destroy.sh
+```
 
 ## Security — what this does and does not do
 
@@ -175,8 +203,6 @@ plaintext secret would be readable through the very tools it protects.
 is their job — and Claude probes `/mcp` unauthenticated on purpose to read the
 `WWW-Authenticate` header. An IAM check would break the handshake before any code
 ran. So the door opens, and `mcp.py` enforces the token instead.
-
----
 
 ## Gotchas
 
